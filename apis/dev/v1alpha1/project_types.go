@@ -265,6 +265,23 @@ type Function struct {
 	// pre-built OCI image tarball. Only used when Source is "Tarball".
 	// +optional
 	Tarball *FunctionTarball `json:"tarball,omitempty"`
+
+	// Inline embeds the function's source code directly into the Compositions
+	// that reference it, rather than building and depending on a separate
+	// function package. Pipeline steps referencing this function are rewritten
+	// at build time to call a generic runtime function, with the source passed
+	// as the step's input.
+	//
+	// Inlining keeps a function's code inside the Composition spec, so each
+	// CompositionRevision captures it. A functionRef is resolved by name
+	// against whichever version of that Function is installed, so code behind
+	// a functionRef does not move with a revision, while inlined code does.
+	//
+	// Only Directory-source KCL functions whose source is self-contained can
+	// be inlined. A function that depends on generated schemas through a local
+	// path dependency cannot, and building it with Inline set is an error.
+	// +optional
+	Inline bool `json:"inline,omitempty"`
 }
 
 // Name returns the name of the function, derived from the source-specific

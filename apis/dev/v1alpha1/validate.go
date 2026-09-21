@@ -252,6 +252,13 @@ func (f *Function) Validate() error {
 		errs = append(errs, errors.Errorf("source %q is not supported, must be one of %q or %q", f.Source, FunctionSourceDirectory, FunctionSourceTarball))
 	}
 
+	// Inlining rewrites a pipeline step to carry the function's source, which
+	// is only possible when we have the source. A Tarball is a pre-built
+	// runtime image.
+	if f.Inline && f.Source == FunctionSourceTarball {
+		errs = append(errs, errors.Errorf("inline is not supported for source %q, which supplies a pre-built image rather than source code", FunctionSourceTarball))
+	}
+
 	return errors.Join(errs...)
 }
 

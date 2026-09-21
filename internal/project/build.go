@@ -214,6 +214,18 @@ func (b *Builder) Build(ctx context.Context, project *devv1alpha1.Project, proje
 		return nil, errors.Wrap(err, "failed to resolve functions")
 	}
 
+	// Inlined functions are embedded into the Compositions that call them, so
+	// they are not built or depended on as packages.
+	packaged := make([]devv1alpha1.Function, 0, len(fns))
+	inlined := make([]devv1alpha1.Function, 0, len(fns))
+	for _, fn := range fns {
+		if fn.Inline {
+			inlined = append(inlined, fn)
+			continue
+		}
+		packaged = append(packaged, fn)
+	}
+
 	apisSource := projectFS
 	apiExcludes := []string{
 		project.Spec.Paths.Examples,
@@ -260,6 +272,16 @@ func (b *Builder) Build(ctx context.Context, project *devv1alpha1.Project, proje
 		o.eventCh.SendEvent("Collecting resources", async.EventStatusFailure)
 		return nil, errors.Wrap(err, "failed to collect operation resources")
 	}
+	if len(inlined) > 0 {
+		o.log.Debug("Inlining functions")
+		inlineDeps, err := inlineFunctions(packageFS, projectFS, project, inlined)
+		if err != nil {
+			o.eventCh.SendEvent("Collecting resources", async.EventStatusFailure)
+			return nil, errors.Wrap(err, "failed to inline functions")
+		}
+		cfg.Spec.DependsOn = append(cfg.Spec.DependsOn, inlineDeps...)
+	}
+
 	o.eventCh.SendEvent("Collecting resources", async.EventStatusSuccess)
 
 	// Generate schemas for declared dependencies. The dependency manager
@@ -283,7 +305,7 @@ func (b *Builder) Build(ctx context.Context, project *devv1alpha1.Project, proje
 
 	// Build the resolved functions.
 	o.log.Debug("Building functions")
-	imgMap, deps, err := b.buildFunctions(ctx, projectFS, project, fns, o.projectBasePath, o.eventCh)
+	imgMap, deps, err := b.buildFunctions(ctx, projectFS, project, packaged, o.projectBasePath, o.eventCh)
 	if err != nil {
 		return nil, err
 	}

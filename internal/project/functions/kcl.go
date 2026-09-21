@@ -47,7 +47,21 @@ import (
 const (
 	crossplaneFunctionRunnerUID = 2000
 	crossplaneFunctionRunnerGID = 2000
+
+	// KCLRuntimePackage is the function package that interprets KCL. It is
+	// both the base image embedded KCL functions are built on and, for inlined
+	// functions, the function a rewritten pipeline step calls directly.
+	KCLRuntimePackage = "xpkg.crossplane.io/crossplane-contrib/function-kcl"
+	// KCLRuntimeVersion pins the KCL runtime. Building and inlining share it
+	// so a project cannot end up running two different KCL versions.
+	KCLRuntimeVersion = "v0.12.1"
 )
+
+// KCLRuntimeFunctionName is the name Crossplane installs the KCL runtime
+// function under, which is what an inlined step's functionRef must use.
+//
+//nolint:gochecknoglobals // Derived from a constant; ToDNSLabel is not const.
+var KCLRuntimeFunctionName = xpkg.ToDNSLabel("crossplane-contrib/function-kcl")
 
 // kclBuilder builds functions written in KCL by injecting their code into a
 // function-kcl base image.
@@ -224,7 +238,7 @@ func setImageEnvvars(image v1.Image, envVars map[string]string) (v1.Image, error
 
 func newKCLBuilder(imageConfigs []v1beta1.ImageConfig) *kclBuilder {
 	return &kclBuilder{
-		baseImage:   "xpkg.crossplane.io/crossplane-contrib/function-kcl:v0.12.1",
+		baseImage:   KCLRuntimePackage + ":" + KCLRuntimeVersion,
 		transport:   http.DefaultTransport,
 		configStore: clixpkg.NewStaticImageConfigStore(imageConfigs),
 	}
