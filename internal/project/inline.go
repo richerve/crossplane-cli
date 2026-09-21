@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -139,6 +140,10 @@ func loadInlineFunction(projectFS afero.Fs, project *devv1alpha1.Project, fn dev
 
 	source, err := concatKCLSource(fnFS)
 	if err != nil {
+		return inlinedFunction{}, err
+	}
+
+	if err := checkLocalImports(fnFS, source); err != nil {
 		return inlinedFunction{}, err
 	}
 
@@ -296,6 +301,53 @@ func concatKCLSource(fnFS afero.Fs) (string, error) {
 	}
 
 	return strings.Join(parts, "\n\n") + "\n", nil
+}
+
+// kclImport matches a KCL import statement, capturing the package path. The
+// path may be dotted ("k8s.api.core.v1") and may be prefixed with dots to
+// make it explicitly relative (".composition").
+var kclImport = regexp.MustCompile(`(?m)^\s*import\s+(\.*[\w.]+)`)
+
+// checkLocalImports rejects source that imports another package from inside
+// the function's own directory.
+//
+// Subdirectories of a KCL module are separate packages, reached with imports
+// like "import composition". Only the function's top-level package is inlined,
+// so those imports would not resolve in the function pod. Flattening them
+// would mean rewriting every qualified reference to a new name, which needs a
+// KCL parser rather than text handling.
+//
+// This has to be caught here. The build would otherwise succeed and produce a
+// Composition that fails when Crossplane runs it.
+func checkLocalImports(fnFS afero.Fs, source string) error {
+	local := make([]string, 0)
+	for _, m := range kclImport.FindAllStringSubmatch(source, -1) {
+		path := m[1]
+
+		// A leading dot makes an import explicitly relative, so it always
+		// refers to a package inside this module.
+		relative := strings.HasPrefix(path, ".")
+
+		// Otherwise it is local only if the first segment names one of the
+		// function's own subdirectories, rather than a registry dependency.
+		head, _, _ := strings.Cut(strings.TrimLeft(path, "."), ".")
+		dir, err := afero.DirExists(fnFS, head)
+		if err != nil {
+			return errors.Wrapf(err, "cannot check whether import %q is local", path)
+		}
+
+		if relative || dir {
+			local = append(local, path)
+		}
+	}
+
+	if len(local) == 0 {
+		return nil
+	}
+
+	slices.Sort(local)
+
+	return errors.Errorf("source imports %s from within the function, and only the function's top-level package is inlined; move the code into the top-level package or build this function as a package", strings.Join(slices.Compact(local), ", "))
 }
 
 // rewriteCompositions walks the Compositions staged for packaging and rewrites

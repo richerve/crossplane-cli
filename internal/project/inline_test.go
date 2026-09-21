@@ -153,6 +153,42 @@ func TestInlineFunctions(t *testing.T) {
 			fns:     []devv1alpha1.Function{inlineFn("my-fn")},
 			wantErr: "must pin dependencies exactly",
 		},
+		"LocalSubpackageImportIsRejected": {
+			projectFiles: map[string]string{
+				"functions/my-fn/kcl.mod":            "[package]\nname = \"my-fn\"\n",
+				"functions/my-fn/main.k":             "import composition\nitems = composition.render()\n",
+				"functions/my-fn/composition/main.k": "render = lambda -> any { [] }\n",
+			},
+			packageFiles: map[string]string{
+				"/apis/composition.yaml": composition(step("my-fn", testRef)),
+			},
+			fns:     []devv1alpha1.Function{inlineFn("my-fn")},
+			wantErr: "only the function's top-level package is inlined",
+		},
+		"ExplicitlyRelativeImportIsRejected": {
+			projectFiles: map[string]string{
+				"functions/my-fn/kcl.mod": "[package]\nname = \"my-fn\"\n",
+				"functions/my-fn/main.k":  "import .helpers\nitems = []\n",
+			},
+			packageFiles: map[string]string{
+				"/apis/composition.yaml": composition(step("my-fn", testRef)),
+			},
+			fns:     []devv1alpha1.Function{inlineFn("my-fn")},
+			wantErr: "only the function's top-level package is inlined",
+		},
+		"RegistryImportIsNotMistakenForLocal": {
+			projectFiles: map[string]string{
+				"functions/my-fn/kcl.mod": "[package]\nname = \"my-fn\"\n\n[dependencies]\nk8s = \"1.36\"\n",
+				"functions/my-fn/main.k":  "import k8s.api.core.v1 as k8core\nitems = []\n",
+			},
+			packageFiles: map[string]string{
+				"/apis/composition.yaml": composition(step("my-fn", testRef)),
+			},
+			fns:          []devv1alpha1.Function{inlineFn("my-fn")},
+			wantSource:   "import k8s.api.core.v1 as k8core\nitems = []\n",
+			wantDeps:     "k8s = \"1.36\"",
+			wantRewrites: 1,
+		},
 		"NonKCLFunctionIsRejected": {
 			projectFiles: map[string]string{
 				"functions/my-fn/go.mod": "module example.com/my-fn\n",
