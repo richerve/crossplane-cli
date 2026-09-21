@@ -51,6 +51,10 @@ const (
 	// kclModFile is the KCL module manifest, present in every KCL function
 	// directory.
 	kclModFile = "kcl.mod"
+
+	// kclTestSuffix identifies a KCL test file. Tests are not part of the
+	// function's runtime behaviour, so they are left out of inlined source.
+	kclTestSuffix = "_test.k"
 )
 
 // inlinedFunction is the source of a single function, extracted from the
@@ -275,6 +279,13 @@ func concatKCLSource(fnFS afero.Fs) (string, error) {
 	files := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".k" {
+			continue
+		}
+		// Test files are part of the same package as the code they test, so
+		// they would otherwise be concatenated into the inlined source along
+		// with whatever fixtures they import. KCL collects tests by this
+		// suffix, so it is the language's own definition of what is a test.
+		if strings.HasSuffix(e.Name(), kclTestSuffix) {
 			continue
 		}
 		files = append(files, e.Name())

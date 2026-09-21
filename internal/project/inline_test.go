@@ -105,6 +105,31 @@ func TestInlineFunctions(t *testing.T) {
 			wantSource:   "items = [_a, _b]\n\n_a = 1\n\n_b = 2\n",
 			wantRewrites: 1,
 		},
+		"TestFilesAreExcluded": {
+			projectFiles: map[string]string{
+				"functions/my-fn/kcl.mod":        "[package]\nname = \"my-fn\"\n",
+				"functions/my-fn/main.k":         "items = []\n",
+				"functions/my-fn/main_test.k":    "import testdata\ntest_items = testdata.want\n",
+				"functions/my-fn/testdata/fix.k": "want = []\n",
+			},
+			packageFiles: map[string]string{
+				"/apis/composition.yaml": composition(step("my-fn", testRef)),
+			},
+			fns:          []devv1alpha1.Function{inlineFn("my-fn")},
+			wantSource:   "items = []\n",
+			wantRewrites: 1,
+		},
+		"OnlyTestFilesIsRejected": {
+			projectFiles: map[string]string{
+				"functions/my-fn/kcl.mod":     "[package]\nname = \"my-fn\"\n",
+				"functions/my-fn/main_test.k": "test_a = 1\n",
+			},
+			packageFiles: map[string]string{
+				"/apis/composition.yaml": composition(step("my-fn", testRef)),
+			},
+			fns:     []devv1alpha1.Function{inlineFn("my-fn")},
+			wantErr: "no .k files found",
+		},
 		"ExactRegistryDependencyIsTranslated": {
 			projectFiles: map[string]string{
 				"functions/my-fn/kcl.mod": "[package]\nname = \"my-fn\"\n\n[dependencies]\nk8s = \"1.31\"\n",
