@@ -103,6 +103,25 @@ type ProjectSpec struct {
 	// packaged. If omitted, all subdirectories of the functions path are
 	// treated as Directory-source functions and built automatically.
 	Functions []Function `json:"functions,omitempty"`
+	// VersionedFunctions appends a hash of each embedded function's source to
+	// the OCI repository path it is pushed to, so that every version of a
+	// function's source gets its own repository, its own package, and its own
+	// Function object in the cluster. Pipeline steps referencing those
+	// functions are rewritten at build time to name the version they were
+	// built against; the project's own files are left alone.
+	//
+	// A CompositionRevision records a pipeline step's functionRef but not the
+	// code behind it, so rolling a composite resource back to an older
+	// revision otherwise runs whatever code is installed under that name
+	// today. Versioned functions close that gap: an older revision names an
+	// older Function, which still exists because Crossplane's package manager
+	// never removes a package it installed for a dependency.
+	//
+	// The cost is one repository, one Function object, and one running
+	// function pod per version of each function's source, for as far back as
+	// rollback targets reach.
+	// +optional
+	VersionedFunctions bool `json:"versionedFunctions,omitempty"`
 	// Paths defines the relative paths to various parts of the project.
 	Paths *ProjectPaths `json:"paths,omitempty"`
 	// Architectures indicates for which architectures embedded functions should

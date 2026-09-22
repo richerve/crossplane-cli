@@ -17,6 +17,7 @@ limitations under the License.
 package project
 
 import (
+	"archive/tar"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -745,5 +746,160 @@ func writeRuntimeTarImage(t *testing.T, fsys afero.Fs, path, arch string, img v1
 	}
 	if err := gz.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestBuilderBuildVersionedFunctions covers the whole of what
+// spec.versionedFunctions changes: where a function's package is tagged, what
+// the configuration depends on, and what the packaged Composition calls.
+func TestBuilderBuildVersionedFunctions(t *testing.T) {
+	t.Parallel()
+
+	const fnName = "fn-one"
+
+	stableRef, err := functionRef(testRepository, fnName, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	projFS := afero.NewMemMapFs()
+	writeProject(t, projFS,
+		map[string]string{
+			"db.yaml": xrdYAML("acme.example.com", "xdatabases", "xdatabase", "XDatabase"),
+			"db-comp.yaml": strings.Replace(
+				compositionYAML("xdb", "acme.example.com", "XDatabase"),
+				"pipeline: []",
+				"pipeline:\n  - step: one\n    functionRef:\n      name: "+stableRef,
+				1),
+		},
+		[]string{fnName},
+	)
+
+	proj := &devv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-project"},
+		Spec: devv1alpha1.ProjectSpec{
+			Repository:         testRepository,
+			Architectures:      []string{"amd64"},
+			VersionedFunctions: true,
+		},
+	}
+	proj.Default()
+
+	// The version the build should settle on, computed the same way the build
+	// computes it.
+	version, err := hashFunctionSource(projFS, proj, devv1alpha1.Function{
+		Source:    devv1alpha1.FunctionSourceDirectory,
+		Directory: &devv1alpha1.FunctionDirectory{Name: fnName},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRepo := functionRepository(testRepository, fnName, version)
+	wantRef, err := functionRef(testRepository, fnName, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewBuilder(BuildWithFunctionIdentifier(functions.FakeIdentifier))
+
+	imgMap, err := b.Build(t.Context(), proj, projFS)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// The function package is tagged under the versioned repository, so that is
+	// where push sends it and what the Configuration can depend on.
+	fnRepos := make([]string, 0, len(imgMap))
+	for tag := range imgMap {
+		if tag.TagStr() != ConfigurationTag {
+			fnRepos = append(fnRepos, tag.Repository.Name())
+		}
+	}
+	if diff := cmp.Diff([]string{wantRepo}, fnRepos); diff != "" {
+		t.Errorf("function repositories (-want +got):\n%s", diff)
+	}
+
+	cfgTag, err := constructTag(proj.Spec.Repository, ConfigurationTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := packageStream(t, imgMap[cfgTag])
+
+	// The packaged Composition calls the version that was just built. Without
+	// the rewrite it would still name stableRef, which no longer resolves to
+	// anything once the function is published under a versioned repository.
+	if !strings.Contains(pkg, "name: "+wantRef) {
+		t.Errorf("packaged Composition does not reference %q:\n%s", wantRef, pkg)
+	}
+	if strings.Contains(pkg, "name: "+stableRef+"\n") {
+		t.Errorf("packaged Composition still references the unversioned %q:\n%s", stableRef, pkg)
+	}
+
+	// The Configuration depends on the versioned repository, which is what
+	// makes Crossplane install the versioned Function object.
+	if !strings.Contains(pkg, wantRepo) {
+		t.Errorf("configuration does not depend on %q:\n%s", wantRepo, pkg)
+	}
+
+	// The project's own Composition is untouched, so the source stays readable
+	// and `crossplane render` keeps working against it.
+	src, err := afero.ReadFile(projFS, "apis/db-comp.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "name: "+stableRef) {
+		t.Errorf("the project's own Composition was rewritten:\n%s", src)
+	}
+}
+
+// packageStream returns the package.yaml stream from a built package image.
+func packageStream(t *testing.T, img v1.Image) string {
+	t.Helper()
+
+	cfgFile, err := img.ConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var pkgLayer v1.Layer
+	for _, l := range layers {
+		d, err := l.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfgFile.Config.Labels[xpkg.Label(d.String())] == xpkg.PackageAnnotation {
+			pkgLayer = l
+			break
+		}
+	}
+	if pkgLayer == nil {
+		t.Fatal("no package layer found in image")
+	}
+
+	rc, err := pkgLayer.Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	tr := tar.NewReader(rc)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			t.Fatalf("no %s in package layer: %v", xpkg.StreamFile, err)
+		}
+		if hdr.Name != xpkg.StreamFile {
+			continue
+		}
+		bs, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return string(bs)
 	}
 }

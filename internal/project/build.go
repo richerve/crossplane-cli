@@ -127,9 +127,10 @@ func BuildWithTempDir(dir string) BuilderOption {
 type BuildOption func(o *buildOptions)
 
 type buildOptions struct {
-	log             logging.Logger
-	projectBasePath string
-	eventCh         async.EventChannel
+	log                  logging.Logger
+	projectBasePath      string
+	eventCh              async.EventChannel
+	noFunctionVersioning bool
 }
 
 // BuildWithLogger provides a logger for progress updates during the build.
@@ -144,6 +145,19 @@ func BuildWithLogger(l logging.Logger) BuildOption {
 func BuildWithEventChannel(ch async.EventChannel) BuildOption {
 	return func(o *buildOptions) {
 		o.eventCh = ch
+	}
+}
+
+// BuildWithoutFunctionVersioning builds the project as though
+// spec.versionedFunctions were unset.
+//
+// `crossplane render` needs this. It runs a build to get the function images,
+// but it renders the Composition as it exists in the project's source, where
+// pipeline steps still carry the unversioned functionRef. Versioning that
+// build's function names would leave render unable to resolve any of them.
+func BuildWithoutFunctionVersioning() BuildOption {
+	return func(o *buildOptions) {
+		o.noFunctionVersioning = true
 	}
 }
 
@@ -281,13 +295,34 @@ func (b *Builder) Build(ctx context.Context, project *devv1alpha1.Project, proje
 		o.eventCh.SendEvent("Generating schemas", async.EventStatusSuccess)
 	}
 
+	// Work out the versioned name of each function before building it, so
+	// that the package is built and tagged under the repository it will be
+	// pushed to. This has to happen after schema generation: a function reaches
+	// the project's generated models through a symlink in its own directory,
+	// so the models are part of the source being hashed.
+	var versions map[string]functionVersion
+	if project.Spec.VersionedFunctions && !o.noFunctionVersioning {
+		o.log.Debug("Versioning functions")
+		versions, err = versionFunctions(projectFS, project, fns, o.projectBasePath)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to version functions")
+		}
+	}
+
 	// Build the resolved functions.
 	o.log.Debug("Building functions")
-	imgMap, deps, err := b.buildFunctions(ctx, projectFS, project, fns, o.projectBasePath, o.eventCh)
+	imgMap, deps, err := b.buildFunctions(ctx, projectFS, project, fns, versions, o.projectBasePath, o.eventCh)
 	if err != nil {
 		return nil, err
 	}
 	cfg.Spec.DependsOn = append(cfg.Spec.DependsOn, deps...)
+
+	// Point the staged pipeline steps at the versions just built. The project's
+	// own files keep the stable name, so the source stays readable and
+	// `crossplane render` keeps working against it.
+	if err := applyFunctionVersions(packageFS, versions, o.log); err != nil {
+		return nil, errors.Wrap(err, "failed to rewrite versioned function references")
+	}
 
 	// Build the configuration package.
 	o.log.Debug("Building configuration package")
@@ -365,7 +400,7 @@ func resolveFunctions(project *devv1alpha1.Project, projectFS afero.Fs) ([]devv1
 }
 
 // buildFunctions builds the given list of embedded functions.
-func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, project *devv1alpha1.Project, fns []devv1alpha1.Function, basePath string, eventCh async.EventChannel) (ImageTagMap, []xpmetav1.Dependency, error) {
+func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, project *devv1alpha1.Project, fns []devv1alpha1.Function, versions map[string]functionVersion, basePath string, eventCh async.EventChannel) (ImageTagMap, []xpmetav1.Dependency, error) {
 	var (
 		imgMap = make(map[name.Tag]v1.Image)
 		imgMu  sync.Mutex
@@ -386,7 +421,10 @@ func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, projec
 			eventText := fmt.Sprintf("Building function %s", fnName)
 			eventCh.SendEvent(eventText, async.EventStatusStarted)
 
-			fnRepo := fmt.Sprintf("%s_%s", project.Spec.Repository, fnName)
+			fnRepo := functionRepository(project.Spec.Repository, fnName, "")
+			if v, ok := versions[fnName]; ok {
+				fnRepo = v.repo
+			}
 			imgs, err := b.buildFunction(ctx, projectFS, project, fn, basePath)
 			if err != nil {
 				eventCh.SendEvent(eventText, async.EventStatusFailure)
@@ -530,18 +568,26 @@ func (b *Builder) runtimeImages(ctx context.Context, projectFS afero.Fs, project
 	}
 }
 
+// functionBasePath returns the absolute on-disk path of a function's source
+// directory, which is what FSToTar needs to resolve the symlink a function uses
+// to reach the project's generated models. It is empty when the project is not
+// backed by the OS filesystem, in which case there are no symlinks to follow.
+func functionBasePath(fnFS afero.Fs, project *devv1alpha1.Project, dirName, basePath string) string {
+	if basePath != "" {
+		return filepath.Join(basePath, project.Spec.Paths.Functions, dirName)
+	}
+	if bfs, ok := fnFS.(*afero.BasePathFs); ok {
+		return afero.FullBaseFsPath(bfs, ".")
+	}
+
+	return ""
+}
+
 // buildDirectoryRuntime invokes the appropriate language builder to produce
 // runtime images from a function's source directory.
 func (b *Builder) buildDirectoryRuntime(ctx context.Context, projectFS afero.Fs, project *devv1alpha1.Project, dir *devv1alpha1.FunctionDirectory, basePath string) ([]v1.Image, error) {
 	fnFS := afero.NewBasePathFs(projectFS, filepath.Join(project.Spec.Paths.Functions, dir.Name))
-
-	fnBasePath := ""
-	if basePath != "" {
-		fnBasePath = filepath.Join(basePath, project.Spec.Paths.Functions, dir.Name)
-	}
-	if bfs, ok := fnFS.(*afero.BasePathFs); ok && fnBasePath == "" {
-		fnBasePath = afero.FullBaseFsPath(bfs, ".")
-	}
+	fnBasePath := functionBasePath(fnFS, project, dir.Name, basePath)
 
 	fnBuilder, err := b.functionIdentifier.Identify(fnFS, project.Spec.ImageConfigs)
 	if err != nil {

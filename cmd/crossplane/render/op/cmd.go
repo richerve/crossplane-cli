@@ -404,6 +404,10 @@ func (c *Cmd) loadFunctions(ctx context.Context, log logging.Logger, sp terminal
 		imgMap, err := b.Build(ctx, proj, projFS,
 			project.BuildWithLogger(log),
 			project.BuildWithEventChannel(ch),
+			// Render reads the resources out of the project's source, where
+			// pipeline steps carry the unversioned functionRef, so the
+			// functions it loads have to be named to match.
+			project.BuildWithoutFunctionVersioning(),
 		)
 		if err != nil {
 			return err
