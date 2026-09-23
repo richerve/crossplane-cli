@@ -17,6 +17,8 @@ limitations under the License.
 package functions
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"os"
 	"path/filepath"
@@ -25,14 +27,25 @@ import (
 	"github.com/google/go-cmp/cmp"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/cache"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 )
 
+// testLayer returns a gzipped layer, like the ones a registry serves. The
+// filesystem cache checks an entry's digest when it reads it back, and a blob
+// that is not compressed would be recompressed on the way, so it would never
+// match.
 func testLayer() v1.Layer {
-	return static.NewLayer([]byte("hello from a layer"), types.DockerLayer)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write([]byte("hello from a layer"))
+	_ = zw.Close()
+	return static.NewLayer(buf.Bytes(), types.DockerLayer)
 }
 
 func readAll(t *testing.T, l v1.Layer) string {
@@ -42,7 +55,11 @@ func readAll(t *testing.T, l v1.Layer) string {
 		t.Fatalf("Compressed(): unexpected error: %v", err)
 	}
 	defer func() { _ = rc.Close() }()
-	bs, err := io.ReadAll(rc)
+	zr, err := gzip.NewReader(rc)
+	if err != nil {
+		t.Fatalf("reading layer: unexpected error: %v", err)
+	}
+	bs, err := io.ReadAll(zr)
 	if err != nil {
 		t.Fatalf("reading layer: unexpected error: %v", err)
 	}
@@ -94,7 +111,7 @@ func TestTolerantCacheUnwritableDirStillReads(t *testing.T) {
 		t.Fatalf("creating read-only cache dir: %v", err)
 	}
 
-	plain := cache.NewFilesystemCache(dir)
+	plain := newFilesystemCache(dir)
 	l, err := plain.Put(testLayer())
 	if err != nil {
 		t.Fatalf("Put(): unexpected error: %v", err)
@@ -104,7 +121,7 @@ func TestTolerantCacheUnwritableDirStillReads(t *testing.T) {
 	}
 
 	// Same directory, wrapped: the layer must read regardless.
-	tolerant := tolerantCache{cache.NewFilesystemCache(dir)}
+	tolerant := tolerantCache{newFilesystemCache(dir)}
 	wrapped, err := tolerant.Put(testLayer())
 	if err != nil {
 		t.Fatalf("Put(): unexpected error: %v", err)
@@ -117,7 +134,7 @@ func TestTolerantCacheUnwritableDirStillReads(t *testing.T) {
 func TestTolerantCachePassesThroughOnSuccess(t *testing.T) {
 	// A working cache must behave exactly as it would unwrapped: a miss is
 	// still a miss, and a stored layer still reads back.
-	c := tolerantCache{cache.NewFilesystemCache(t.TempDir())}
+	c := tolerantCache{newFilesystemCache(t.TempDir())}
 
 	if _, err := c.Get(v1.Hash{Algorithm: "sha256", Hex: "cafe"}); !errors.Is(err, cache.ErrNotFound) {
 		t.Errorf("Get() on empty cache: want cache.ErrNotFound, got %v", err)
@@ -138,5 +155,166 @@ func TestTolerantCachePassesThroughOnSuccess(t *testing.T) {
 	}
 	if _, err := c.Get(d); err != nil {
 		t.Errorf("Get() after populating cache: unexpected error: %v", err)
+	}
+}
+
+func TestFilesystemCacheUnreadLayerLeavesNoEntry(t *testing.T) {
+	// Opening a layer and closing it without reading it must neither create
+	// an entry nor damage an existing one. go-containerregistry's filesystem
+	// cache truncated the entry to zero bytes here.
+	dir := t.TempDir()
+	c := newFilesystemCache(dir)
+	l, err := c.Put(testLayer())
+	if err != nil {
+		t.Fatalf("Put(): unexpected error: %v", err)
+	}
+	d, err := l.Digest()
+	if err != nil {
+		t.Fatalf("Digest(): unexpected error: %v", err)
+	}
+
+	rc, err := l.Compressed()
+	if err != nil {
+		t.Fatalf("Compressed(): unexpected error: %v", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close(): unexpected error: %v", err)
+	}
+	if _, err := c.Get(d); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("Get() after unread layer: want cache.ErrNotFound, got %v", err)
+	}
+
+	// Populate the entry, then open and abandon the layer again.
+	readAll(t, l)
+	rc, err = l.Compressed()
+	if err != nil {
+		t.Fatalf("Compressed(): unexpected error: %v", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close(): unexpected error: %v", err)
+	}
+	got, err := c.Get(d)
+	if err != nil {
+		t.Fatalf("Get() after populating cache: unexpected error: %v", err)
+	}
+	if diff := cmp.Diff("hello from a layer", readAll(t, got)); diff != "" {
+		t.Errorf("cached layer contents (-want +got):\n%s", diff)
+	}
+
+	// Nothing should be left behind but the entry itself.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(): unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("cache directory: want 1 entry, got %d", len(entries))
+	}
+}
+
+func TestFilesystemCachePartialReadLeavesNoEntry(t *testing.T) {
+	c := newFilesystemCache(t.TempDir())
+	l, err := c.Put(testLayer())
+	if err != nil {
+		t.Fatalf("Put(): unexpected error: %v", err)
+	}
+	d, err := l.Digest()
+	if err != nil {
+		t.Fatalf("Digest(): unexpected error: %v", err)
+	}
+
+	rc, err := l.Compressed()
+	if err != nil {
+		t.Fatalf("Compressed(): unexpected error: %v", err)
+	}
+	if _, err := rc.Read(make([]byte, 4)); err != nil {
+		t.Fatalf("Read(): unexpected error: %v", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close(): unexpected error: %v", err)
+	}
+
+	if _, err := c.Get(d); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("Get() after partial read: want cache.ErrNotFound, got %v", err)
+	}
+}
+
+func TestFilesystemCacheGetDropsCorruptEntry(t *testing.T) {
+	// Entries written before this cache existed may be truncated. Get must
+	// report them as misses and remove them so they are cached afresh.
+	dir := t.TempDir()
+	c := newFilesystemCache(dir)
+	d, err := testLayer().Digest()
+	if err != nil {
+		t.Fatalf("Digest(): unexpected error: %v", err)
+	}
+	p := fsCache{dir: dir}.path(d)
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		t.Fatalf("writing truncated entry: %v", err)
+	}
+
+	if _, err := c.Get(d); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("Get() on truncated entry: want cache.ErrNotFound, got %v", err)
+	}
+	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("truncated entry: want it removed, got Stat() error %v", err)
+	}
+}
+
+func TestFilesystemCacheSurvivesSideloadOfSharedLayers(t *testing.T) {
+	// The regression this guards: baseImageForArch resolves each
+	// architecture's layers through its own cache.Image while the cache is
+	// cold, so both architectures hold a caching wrapper for any layer they
+	// share. Writing both images to an OCI layout (as the local dev control
+	// plane's sideload does) reads the shared layer through the first wrapper
+	// and opens then abandons it through the second, because the layout
+	// already holds the blob. That used to leave a zero-byte entry that the
+	// next build baked into its images as an empty layer.
+	shared := testLayer()
+	d, err := shared.Digest()
+	if err != nil {
+		t.Fatalf("Digest(): unexpected error: %v", err)
+	}
+	dir := t.TempDir()
+
+	images := make([]v1.Image, 0, 2)
+	for _, arch := range []string{"amd64", "arm64"} {
+		src, err := mutate.AppendLayers(empty.Image, shared)
+		if err != nil {
+			t.Fatalf("AppendLayers(): unexpected error: %v", err)
+		}
+		src = cache.Image(src, tolerantCache{newFilesystemCache(dir)})
+		l, err := src.LayerByDigest(d)
+		if err != nil {
+			t.Fatalf("LayerByDigest(): unexpected error: %v", err)
+		}
+		img, err := mutate.ConfigFile(empty.Image, &v1.ConfigFile{Architecture: arch, OS: "linux"})
+		if err != nil {
+			t.Fatalf("ConfigFile(): unexpected error: %v", err)
+		}
+		img, err = mutate.AppendLayers(img, l)
+		if err != nil {
+			t.Fatalf("AppendLayers(): unexpected error: %v", err)
+		}
+		images = append(images, img)
+	}
+
+	idx := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{Add: images[0]},
+		mutate.IndexAddendum{Add: images[1]},
+	)
+	lp, err := layout.Write(t.TempDir(), empty.Index)
+	if err != nil {
+		t.Fatalf("layout.Write(): unexpected error: %v", err)
+	}
+	if err := lp.AppendIndex(idx); err != nil {
+		t.Fatalf("AppendIndex(): unexpected error: %v", err)
+	}
+
+	got, err := newFilesystemCache(dir).Get(d)
+	if err != nil {
+		t.Fatalf("Get() after sideload: unexpected error: %v", err)
+	}
+	if diff := cmp.Diff("hello from a layer", readAll(t, got)); diff != "" {
+		t.Errorf("cached layer contents (-want +got):\n%s", diff)
 	}
 }
