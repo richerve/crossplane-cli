@@ -785,21 +785,6 @@ func TestBuilderBuildVersionedFunctions(t *testing.T) {
 	}
 	proj.Default()
 
-	// The version the build should settle on, computed the same way the build
-	// computes it.
-	version, err := hashFunctionSource(projFS, proj, devv1alpha1.Function{
-		Source:    devv1alpha1.FunctionSourceDirectory,
-		Directory: &devv1alpha1.FunctionDirectory{Name: fnName},
-	}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantRepo := functionRepository(testRepository, fnName, version)
-	wantRef, err := functionRef(testRepository, fnName, version)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	b := NewBuilder(BuildWithFunctionIdentifier(functions.FakeIdentifier))
 
 	imgMap, err := b.Build(t.Context(), proj, projFS)
@@ -807,16 +792,38 @@ func TestBuilderBuildVersionedFunctions(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	// The function package is tagged under the versioned repository, so that is
+	// The function package is tagged under a versioned repository, so that is
 	// where push sends it and what the Configuration can depend on.
-	fnRepos := make([]string, 0, len(imgMap))
+	var fnTags []name.Tag
 	for tag := range imgMap {
 		if tag.TagStr() != ConfigurationTag {
-			fnRepos = append(fnRepos, tag.Repository.Name())
+			fnTags = append(fnTags, tag)
 		}
 	}
-	if diff := cmp.Diff([]string{wantRepo}, fnRepos); diff != "" {
-		t.Errorf("function repositories (-want +got):\n%s", diff)
+	if len(fnTags) != 1 {
+		t.Fatalf("want one function image tag, got %v", fnTags)
+	}
+
+	// The version is the start of the digest of the index push and sideload
+	// build from the tagged images, which is what the Configuration pins. The
+	// name and the pinned digest have to move together: Crossplane will not
+	// move an installed dependency to a new digest under the same name.
+	idx, _, err := BuildIndex(imgMap[fnTags[0]])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dgst, err := idx.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := dgst.Hex[:functionVersionLength]
+	wantRepo := functionRepository(testRepository, fnName, version)
+	wantRef, err := functionRef(testRepository, fnName, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(wantRepo, fnTags[0].Repository.Name()); diff != "" {
+		t.Errorf("function repository (-want +got):\n%s", diff)
 	}
 
 	cfgTag, err := constructTag(proj.Spec.Repository, ConfigurationTag)
@@ -835,10 +842,14 @@ func TestBuilderBuildVersionedFunctions(t *testing.T) {
 		t.Errorf("packaged Composition still references the unversioned %q:\n%s", stableRef, pkg)
 	}
 
-	// The Configuration depends on the versioned repository, which is what
-	// makes Crossplane install the versioned Function object.
+	// The Configuration depends on the versioned repository at the digest the
+	// version was taken from, which is what makes Crossplane install the
+	// versioned Function object.
 	if !strings.Contains(pkg, wantRepo) {
 		t.Errorf("configuration does not depend on %q:\n%s", wantRepo, pkg)
+	}
+	if !strings.Contains(pkg, dgst.String()) {
+		t.Errorf("configuration does not pin %q:\n%s", dgst, pkg)
 	}
 
 	// The project's own Composition is untouched, so the source stays readable

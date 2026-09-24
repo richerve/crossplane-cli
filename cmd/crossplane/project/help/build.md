@@ -36,9 +36,9 @@ the older pipeline and then runs whatever function code is installed under those
 names today.
 
 Setting `spec.versionedFunctions: true` in `crossplane-project.yaml` closes that
-gap. The build hashes each embedded function's source and appends the hash to
-the repository the function is pushed to, so each version of a function's source
-becomes its own package and, once installed, its own `Function` object:
+gap. The build appends the first 12 characters of each embedded function's
+package digest to the repository the function is pushed to, so each version of a
+function becomes its own package and, once installed, its own `Function` object:
 
 ```
 ghcr.io/my-org/my-project_compose-sql-a1b2c3d4e5f6
@@ -50,18 +50,24 @@ name the version they were built against. Your own files are not touched: they
 keep the stable name, which is what `crossplane function generate` writes and
 what `crossplane render` resolves against.
 
-The hash covers everything that goes into the function's runtime image,
-including the generated models a function reaches through the `model` symlink in
-its directory. It does not cover the runtime base image, so a base image change
-reuses the same name at a new digest.
+The version is the digest the Configuration depends on the function at, so it
+covers everything in the function's package: its source, the generated models it
+reaches through the `model` symlink in its directory, its dependencies and the
+runtime base image. A function's name changes exactly when that digest changes.
+Crossplane does not move an installed dependency to a new digest, so a name that
+stayed put while its digest moved would stop the Configuration from upgrading.
+
+Builds are reproducible, so rebuilding a function whose source has not changed
+gives the same digest and the same name. A function built from a floating base
+image tag, or with dependencies that are not pinned, gets a new version when the
+base image or a dependency changes, even if its source has not.
 
 A function reference is a DNS label, which is cut at 63 characters. If your
 repository path is long enough that the version would be cut off the end, the
 build fails rather than naming every version of the function the same thing.
 
 This costs one repository, one `Function` object and one running function pod
-per version of each function's source, for as far back as your rollback targets
-reach. Nothing removes the old ones: Crossplane's package manager never deletes
+per version of each function, for as far back as your rollback targets reach. Nothing removes the old ones: Crossplane's package manager never deletes
 a package it installed to satisfy a dependency.
 
 ## Examples
