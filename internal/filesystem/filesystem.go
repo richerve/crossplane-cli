@@ -26,6 +26,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/afero"
 
@@ -147,7 +148,84 @@ func WithExcludePrefix(prefix string) FSToTarOption {
 	}
 }
 
-// FSToTar produces a tarball of all the files in a filesystem.
+// reproducibleEpoch is the modification time, in seconds since the Unix epoch,
+// that FSToTar and ReproducibleTar give every entry. It matches the default
+// SOURCE_DATE_EPOCH ko builds Go functions with.
+const reproducibleEpoch = 0
+
+// normalizeHeader strips what a file's header records about the machine and
+// checkout it came from, so that the same source tars to the same bytes
+// wherever and whenever it is built. An embedded function's layers are built
+// from these tars, and any change to a layer gives the function a new digest.
+//
+// A checkout's modification times say when it was cloned or last switched
+// branch, its owner is whoever ran the build, and its permission bits depend
+// on that user's umask. Only the executable bit carries meaning, so modes are
+// reduced to 0o755 or 0o644.
+func normalizeHeader(h *tar.Header, cfg *fsToTarConfig) {
+	h.ModTime = time.Unix(reproducibleEpoch, 0)
+	h.AccessTime = time.Time{}
+	h.ChangeTime = time.Time{}
+
+	h.Uid, h.Gid = 0, 0
+	h.Uname, h.Gname = "", ""
+	if cfg.uidOverride != nil {
+		h.Uid = *cfg.uidOverride
+	}
+	if cfg.gidOverride != nil {
+		h.Gid = *cfg.gidOverride
+	}
+
+	if h.Typeflag == tar.TypeDir || h.Mode&0o111 != 0 {
+		h.Mode = 0o755
+	} else {
+		h.Mode = 0o644
+	}
+}
+
+// ReproducibleTar rewrites a tar archive with every entry's modification time
+// set to a fixed value and its access and change times dropped. Use it on an
+// archive produced by a tool that stamps the time it ran, such as a copy out
+// of a build container. Ownership and permissions are kept.
+func ReproducibleTar(in []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	tr := tar.NewReader(bytes.NewReader(in))
+	tw := tar.NewWriter(&buf)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to read tar archive")
+		}
+
+		h.ModTime = time.Unix(reproducibleEpoch, 0)
+		h.AccessTime = time.Time{}
+		h.ChangeTime = time.Time{}
+		for _, k := range []string{"mtime", "atime", "ctime"} {
+			delete(h.PAXRecords, k)
+		}
+		// Let the writer pick the smallest format that fits what is left, so
+		// dropped times are not carried over by a PAX header.
+		h.Format = tar.FormatUnknown
+
+		if err := tw.WriteHeader(h); err != nil {
+			return nil, errors.Wrapf(err, "failed to write tar header for %q", h.Name)
+		}
+		if _, err := io.Copy(tw, tr); err != nil { //nolint:gosec // Copying an archive we were handed, not extracting it.
+			return nil, errors.Wrapf(err, "failed to copy %q", h.Name)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil, errors.Wrap(err, "failed to close tar archive")
+	}
+	return buf.Bytes(), nil
+}
+
+// FSToTar produces a tarball of all the files in a filesystem. Entries carry
+// fixed modification times and ownership, and normalized permissions, so that
+// the same files always produce the same tarball. See normalizeHeader.
 func FSToTar(f afero.Fs, prefix string, opts ...FSToTarOption) ([]byte, error) {
 	cfg := &fsToTarConfig{}
 	for _, opt := range opts {
@@ -160,6 +238,7 @@ func FSToTar(f afero.Fs, prefix string, opts ...FSToTarOption) ([]byte, error) {
 		Name:     prefix,
 		Typeflag: tar.TypeDir,
 		Mode:     0o777,
+		ModTime:  time.Unix(reproducibleEpoch, 0),
 	}
 	if cfg.uidOverride != nil {
 		prefixHdr.Uid = *cfg.uidOverride
@@ -214,12 +293,7 @@ func addToTar(tw *tar.Writer, prefix string, f afero.Fs, filename string, info f
 			return err
 		}
 		h.Name = fullPath
-		if cfg.uidOverride != nil {
-			h.Uid = *cfg.uidOverride
-		}
-		if cfg.gidOverride != nil {
-			h.Gid = *cfg.gidOverride
-		}
+		normalizeHeader(h, cfg)
 		return tw.WriteHeader(h)
 	}
 
@@ -232,12 +306,7 @@ func addToTar(tw *tar.Writer, prefix string, f afero.Fs, filename string, info f
 		return err
 	}
 	h.Name = fullPath
-	if cfg.uidOverride != nil {
-		h.Uid = *cfg.uidOverride
-	}
-	if cfg.gidOverride != nil {
-		h.Gid = *cfg.gidOverride
-	}
+	normalizeHeader(h, cfg)
 	if err := tw.WriteHeader(h); err != nil {
 		return err
 	}
@@ -284,12 +353,7 @@ func addSymlinkToTar(tw *tar.Writer, prefix string, symlinkPath string, cfg *fsT
 			return err
 		}
 		targetHeader.Name = path.Join(prefix, filepath.ToSlash(symlinkPath), filepath.ToSlash(relativePath))
-		if cfg.uidOverride != nil {
-			targetHeader.Uid = *cfg.uidOverride
-		}
-		if cfg.gidOverride != nil {
-			targetHeader.Gid = *cfg.gidOverride
-		}
+		normalizeHeader(targetHeader, cfg)
 
 		if err := tw.WriteHeader(targetHeader); err != nil {
 			return err

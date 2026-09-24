@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/afero"
@@ -72,7 +73,7 @@ func TestFSToTar(t *testing.T) {
 			prefix: "my-prefix/",
 			expectedFiles: map[string]fileInfo{
 				"my-prefix/":         {mode: 0o777},
-				"my-prefix/file.txt": {mode: 0o777},
+				"my-prefix/file.txt": {mode: 0o755},
 			},
 		},
 		{
@@ -96,8 +97,23 @@ func TestFSToTar(t *testing.T) {
 			prefix: "another-prefix/",
 			expectedFiles: map[string]fileInfo{
 				"another-prefix/":          {mode: 0o777},
-				"another-prefix/file1.txt": {mode: 0o777},
-				"another-prefix/file2.txt": {mode: 0o777},
+				"another-prefix/file1.txt": {mode: 0o755},
+				"another-prefix/file2.txt": {mode: 0o755},
+			},
+		},
+		{
+			name: "PermissionsNormalized",
+			setupFs: func(fs afero.Fs) {
+				// A umask of 002 leaves group write set; only the executable
+				// bit should survive.
+				_ = afero.WriteFile(fs, "data.txt", []byte("data"), 0o664)
+				_ = afero.WriteFile(fs, "run.sh", []byte("#!/bin/sh"), 0o775)
+			},
+			prefix: "my-prefix/",
+			expectedFiles: map[string]fileInfo{
+				"my-prefix/":         {mode: 0o777},
+				"my-prefix/data.txt": {mode: 0o644},
+				"my-prefix/run.sh":   {mode: 0o755},
 			},
 		},
 		{
@@ -113,8 +129,8 @@ func TestFSToTar(t *testing.T) {
 			},
 			expectedFiles: map[string]fileInfo{
 				"my-prefix/":          {mode: 0o777, uid: 2345},
-				"my-prefix/file1.txt": {mode: 0o777, uid: 2345},
-				"my-prefix/file2.txt": {mode: 0o777, uid: 2345},
+				"my-prefix/file1.txt": {mode: 0o755, uid: 2345},
+				"my-prefix/file2.txt": {mode: 0o755, uid: 2345},
 			},
 		},
 		{
@@ -130,8 +146,8 @@ func TestFSToTar(t *testing.T) {
 			},
 			expectedFiles: map[string]fileInfo{
 				"my-prefix/":          {mode: 0o777, gid: 2345},
-				"my-prefix/file1.txt": {mode: 0o777, gid: 2345},
-				"my-prefix/file2.txt": {mode: 0o777, gid: 2345},
+				"my-prefix/file1.txt": {mode: 0o755, gid: 2345},
+				"my-prefix/file2.txt": {mode: 0o755, gid: 2345},
 			},
 		},
 	}
@@ -720,5 +736,97 @@ func TestWalkSkipDirHandling(t *testing.T) {
 				t.Errorf("(-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestFSToTarIsReproducible(t *testing.T) {
+	// The same files must tar to the same bytes however long ago they were
+	// checked out, since function image digests are built from these tars.
+	build := func(mtime time.Time) []byte {
+		t.Helper()
+		fs := afero.NewMemMapFs()
+		_ = afero.WriteFile(fs, "main.k", []byte("x = 1"), 0o644)
+		_ = fs.Mkdir("sub", 0o755)
+		_ = afero.WriteFile(fs, "sub/lib.k", []byte("y = 2"), 0o644)
+		for _, name := range []string{"main.k", "sub", "sub/lib.k"} {
+			if err := fs.Chtimes(name, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out, err := FSToTar(fs, "/src")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	a := build(time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC))
+	b := build(time.Date(2026, 9, 24, 17, 30, 12, 0, time.UTC))
+	if !bytes.Equal(a, b) {
+		t.Errorf("FSToTar(): same files with different modification times produced different archives")
+	}
+}
+
+func TestReproducibleTar(t *testing.T) {
+	// Two copies of the same tree, stamped with different times the way a
+	// copy out of a build container is, must come out identical and keep
+	// their ownership and permissions.
+	build := func(mtime time.Time) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		hdrs := []*tar.Header{
+			{Name: "fn/", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: mtime, AccessTime: mtime, ChangeTime: mtime, Format: tar.FormatPAX},
+			{Name: "fn/bin/python", Typeflag: tar.TypeSymlink, Linkname: "/usr/bin/python3", Mode: 0o777, ModTime: mtime, Format: tar.FormatPAX},
+			{Name: "fn/app.py", Typeflag: tar.TypeReg, Mode: 0o644, Uid: 65532, Gid: 65532, Uname: "nonroot", Size: 5, ModTime: mtime, AccessTime: mtime, ChangeTime: mtime, Format: tar.FormatPAX},
+		}
+		for _, h := range hdrs {
+			if err := tw.WriteHeader(h); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := tw.Write([]byte("print")); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		out, err := ReproducibleTar(buf.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	a := build(time.Date(2026, 9, 23, 14, 6, 1, 500, time.UTC))
+	b := build(time.Date(2026, 9, 24, 9, 12, 44, 0, time.UTC))
+	if !bytes.Equal(a, b) {
+		t.Fatalf("ReproducibleTar(): archives differing only in times still differ")
+	}
+
+	tr := tar.NewReader(bytes.NewReader(a))
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !h.ModTime.Equal(time.Unix(reproducibleEpoch, 0)) {
+			t.Errorf("%s: ModTime: want %v, got %v", h.Name, time.Unix(reproducibleEpoch, 0), h.ModTime)
+		}
+		if h.Name == "fn/app.py" {
+			if diff := cmp.Diff([]any{int64(0o644), 65532, 65532, "nonroot"}, []any{h.Mode, h.Uid, h.Gid, h.Uname}); diff != "" {
+				t.Errorf("fn/app.py: mode and ownership (-want +got):\n%s", diff)
+			}
+			body, _ := io.ReadAll(tr)
+			if diff := cmp.Diff("print", string(body)); diff != "" {
+				t.Errorf("fn/app.py: content (-want +got):\n%s", diff)
+			}
+		}
+		if h.Name == "fn/bin/python" && h.Linkname != "/usr/bin/python3" {
+			t.Errorf("fn/bin/python: Linkname: want /usr/bin/python3, got %q", h.Linkname)
+		}
 	}
 }

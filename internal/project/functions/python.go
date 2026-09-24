@@ -73,8 +73,14 @@ for arch in $ARCHS ; do
     --platform=manylinux_2_39_$arch \
     --platform=manylinux_1_2_$arch \
     --only-binary=:all: \
+    --no-compile \
     --target=/fn_$arch/lib/python$PY_VERSION/site-packages \
     /whl/*.whl
+  # pip --target installs into a temporary directory and moves the result, so
+  # byte-compiling during the install would record that random path in every
+  # .pyc. Compile where the files will live instead.
+  python3 -m compileall -q -f -j0 --invalidation-mode checked-hash \
+    /fn_$arch/lib/python$PY_VERSION/site-packages
 done
 `
 )
@@ -219,6 +225,15 @@ func (b *pythonBuilder) buildVenv(ctx context.Context, c BuildContext) (map[stri
 		docker.StartWithEnv(
 			"ARCHS="+strings.Join(pyArchitectures, " "),
 			"PY_VERSION="+pythonVersion,
+			// Keep the build from stamping the time it ran into the venv.
+			// With SOURCE_DATE_EPOCH set, hatch builds a reproducible wheel
+			// and anything byte-compiled without an explicit invalidation
+			// mode, such as the venv's own pip, records its source's hash
+			// rather than its install time. A fixed hash seed keeps set
+			// constants in .pyc files in the same order. 1980-01-01 is the
+			// earliest time a wheel, being a zip, can record.
+			"SOURCE_DATE_EPOCH=315532800",
+			"PYTHONHASHSEED=0",
 		),
 		docker.StartWithCommand([]string{"sh", "-c", pythonBuildScript}),
 		docker.StartWithWorkingDirectory("/" + filepath.ToSlash(c.FunctionPath)),
@@ -242,9 +257,14 @@ func (b *pythonBuilder) buildVenv(ctx context.Context, c BuildContext) (map[stri
 	ret := make(map[string][]byte)
 	for _, arch := range c.Architectures {
 		pyArch, _ := pythonArchitecture(arch) // Ignore the error since we already did this once.
-		ret[arch], err = docker.TarFromContainer(ctx, cid, fmt.Sprintf("/fn_%s", pyArch))
+		venv, err := docker.TarFromContainer(ctx, cid, fmt.Sprintf("/fn_%s", pyArch))
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to retrieve built function for architecture %s", arch)
+		}
+		// Every file in the venv carries the time the build ran.
+		ret[arch], err = filesystem.ReproducibleTar(venv)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to normalize built function for architecture %s", arch)
 		}
 	}
 
