@@ -328,3 +328,38 @@ func verifyCodeLayer(t *testing.T, img v1.Image, sourceFS afero.Fs, destPrefix s
 		return nil
 	})
 }
+
+func TestSetImageEnvvarsIsDeterministic(t *testing.T) {
+	// Env is part of the image config, so adding variables in map order gave
+	// every build of a KCL or go-templating function its own digest.
+	envVars := map[string]string{
+		"FUNCTION_KCL_DEFAULT_SOURCE": "/src",
+		"KCL_PKG_PATH":                "/src",
+		"A":                           "1",
+		"Z":                           "26",
+	}
+
+	var first []string
+	for i := range 20 {
+		img, err := setImageEnvvars(empty.Image, envVars)
+		if err != nil {
+			t.Fatalf("setImageEnvvars(): unexpected error: %v", err)
+		}
+		cfg, err := img.ConfigFile()
+		if err != nil {
+			t.Fatalf("ConfigFile(): unexpected error: %v", err)
+		}
+		if i == 0 {
+			first = cfg.Config.Env
+			continue
+		}
+		if diff := cmp.Diff(first, cfg.Config.Env); diff != "" {
+			t.Fatalf("setImageEnvvars(): Env differs between calls (-first +got):\n%s", diff)
+		}
+	}
+
+	want := []string{"A=1", "FUNCTION_KCL_DEFAULT_SOURCE=/src", "KCL_PKG_PATH=/src", "Z=26"}
+	if diff := cmp.Diff(want, first); diff != "" {
+		t.Errorf("setImageEnvvars(): Env (-want +got):\n%s", diff)
+	}
+}

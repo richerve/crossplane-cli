@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 
@@ -210,8 +211,10 @@ func setImageEnvvars(image v1.Image, envVars map[string]string) (v1.Image, error
 	}
 	cfg := cfgFile.Config
 
-	for k, v := range envVars {
-		cfg.Env = append(cfg.Env, fmt.Sprintf("%s=%s", k, v))
+	// Map iteration order is random, and Env is part of the image config, so
+	// ranging over envVars directly would give each build its own digest.
+	for _, k := range slices.Sorted(maps.Keys(envVars)) {
+		cfg.Env = append(cfg.Env, fmt.Sprintf("%s=%s", k, envVars[k]))
 	}
 
 	image, err = mutate.Config(image, cfg)
