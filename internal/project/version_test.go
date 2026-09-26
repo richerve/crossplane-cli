@@ -21,139 +21,13 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/spf13/afero"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
-
-	devv1alpha1 "github.com/crossplane/cli/v2/apis/dev/v1alpha1"
 )
 
 const testRepository = "xpkg.crossplane.io/example/test"
-
-// hashProject returns the source hash of a single Directory-source function in
-// a project whose functions directory holds the given files.
-func hashProject(t *testing.T, files map[string]string) string {
-	t.Helper()
-
-	projFS := afero.NewMemMapFs()
-	for path, content := range files {
-		if err := afero.WriteFile(projFS, "functions/fn-one/"+path, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	proj := &devv1alpha1.Project{Spec: devv1alpha1.ProjectSpec{Repository: testRepository}}
-	proj.Default()
-
-	fn := devv1alpha1.Function{
-		Source:    devv1alpha1.FunctionSourceDirectory,
-		Directory: &devv1alpha1.FunctionDirectory{Name: "fn-one"},
-	}
-
-	h, err := hashFunctionSource(projFS, proj, fn, "")
-	if err != nil {
-		t.Fatalf("hashFunctionSource: %v", err)
-	}
-
-	return h
-}
-
-func TestHashFunctionSource(t *testing.T) {
-	t.Parallel()
-
-	base := map[string]string{
-		"main.k":  "a = 1\n",
-		"kcl.mod": "[package]\nname = \"fn-one\"\n",
-	}
-
-	t.Run("StableAcrossCalls", func(t *testing.T) {
-		t.Parallel()
-
-		if diff := cmp.Diff(hashProject(t, base), hashProject(t, base)); diff != "" {
-			t.Errorf("hash is not stable (-first +second):\n%s", diff)
-		}
-	})
-
-	t.Run("ChangesWithContent", func(t *testing.T) {
-		t.Parallel()
-
-		changed := map[string]string{"main.k": "a = 2\n", "kcl.mod": base["kcl.mod"]}
-		if hashProject(t, base) == hashProject(t, changed) {
-			t.Error("hash did not change when the function's source changed")
-		}
-	})
-
-	t.Run("ChangesWithFileSet", func(t *testing.T) {
-		t.Parallel()
-
-		extra := map[string]string{"main.k": base["main.k"], "kcl.mod": base["kcl.mod"], "helper.k": "b = 1\n"}
-		if hashProject(t, base) == hashProject(t, extra) {
-			t.Error("hash did not change when a file was added")
-		}
-	})
-
-	t.Run("Length", func(t *testing.T) {
-		t.Parallel()
-
-		if got := len(hashProject(t, base)); got != functionVersionLength {
-			t.Errorf("hash length = %d, want %d", got, functionVersionLength)
-		}
-	})
-
-	// A developer's local virtualenv is excluded from the image the Python
-	// builder produces, so it must not move the function's version either.
-	t.Run("IgnoresPythonVenv", func(t *testing.T) {
-		t.Parallel()
-
-		py := map[string]string{"main.py": "x = 1\n", pythonProjectFile: "[project]\nname = \"fn-one\"\n"}
-		withVenv := map[string]string{
-			"main.py":                     py["main.py"],
-			pythonProjectFile:             py[pythonProjectFile],
-			pythonVenvDir + "/lib/pkg.py": "whatever\n",
-		}
-		if diff := cmp.Diff(hashProject(t, py), hashProject(t, withVenv)); diff != "" {
-			t.Errorf("a local virtualenv changed the hash (-without +with):\n%s", diff)
-		}
-	})
-}
-
-// A Python function's generated schemas are staged from outside its directory
-// at build time, so they have to be hashed from outside it too.
-func TestHashFunctionSourcePythonSchemas(t *testing.T) {
-	t.Parallel()
-
-	hash := func(schema string) string {
-		t.Helper()
-
-		projFS := afero.NewMemMapFs()
-		if err := afero.WriteFile(projFS, "functions/fn-one/main.py", []byte("x = 1\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := afero.WriteFile(projFS, "functions/fn-one/"+pythonProjectFile, []byte("[project]\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := afero.WriteFile(projFS, "schemas/python/models/xr.py", []byte(schema), 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		proj := &devv1alpha1.Project{Spec: devv1alpha1.ProjectSpec{Repository: testRepository}}
-		proj.Default()
-
-		h, err := hashFunctionSource(projFS, proj, devv1alpha1.Function{
-			Source:    devv1alpha1.FunctionSourceDirectory,
-			Directory: &devv1alpha1.FunctionDirectory{Name: "fn-one"},
-		}, "")
-		if err != nil {
-			t.Fatalf("hashFunctionSource: %v", err)
-		}
-
-		return h
-	}
-
-	if hash("class XR: pass\n") == hash("class XR:\n    spec = None\n") {
-		t.Error("hash did not change when the generated python schemas changed")
-	}
-}
 
 func TestFunctionRepository(t *testing.T) {
 	t.Parallel()
@@ -166,38 +40,20 @@ func TestFunctionRepository(t *testing.T) {
 	}
 }
 
-func TestVersionFunctions(t *testing.T) {
+// testDigest is an index digest to version a function with.
+var testDigest = v1.Hash{Algorithm: "sha256", Hex: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"}
+
+func TestVersionFunction(t *testing.T) {
 	t.Parallel()
 
-	projFS := afero.NewMemMapFs()
-	if err := afero.WriteFile(projFS, "functions/fn-one/main.k", []byte("a = 1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	proj := &devv1alpha1.Project{Spec: devv1alpha1.ProjectSpec{Repository: testRepository}}
-	proj.Default()
-
-	versions, err := versionFunctions(projFS, proj, []devv1alpha1.Function{{
-		Source:    devv1alpha1.FunctionSourceDirectory,
-		Directory: &devv1alpha1.FunctionDirectory{Name: "fn-one"},
-	}}, "")
+	v, err := versionFunction(testRepository, "fn-one", testDigest)
 	if err != nil {
-		t.Fatalf("versionFunctions: %v", err)
+		t.Fatalf("versionFunction: %v", err)
 	}
 
-	v, ok := versions["fn-one"]
-	if !ok {
-		t.Fatalf("no version for fn-one; got %v", versions)
-	}
-
-	fn := devv1alpha1.Function{
-		Source:    devv1alpha1.FunctionSourceDirectory,
-		Directory: &devv1alpha1.FunctionDirectory{Name: "fn-one"},
-	}
-	version, err := hashFunctionSource(projFS, proj, fn, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The version is the start of the digest the Configuration will depend
+	// on, so the name changes exactly when that digest does.
+	version := testDigest.Hex[:functionVersionLength]
 
 	// The stable ref is what `crossplane function generate` writes into a
 	// Composition, so it must not pick up the version. The versioned ref has to
@@ -223,33 +79,29 @@ func TestVersionFunctions(t *testing.T) {
 	if v.ref == v.stableRef {
 		t.Error("versioned ref is the same as the stable ref")
 	}
+
+	other := testDigest
+	other.Hex = "ffff" + testDigest.Hex[4:]
+	ov, err := versionFunction(testRepository, "fn-one", other)
+	if err != nil {
+		t.Fatalf("versionFunction: %v", err)
+	}
+	if ov.repo == v.repo {
+		t.Error("two different digests gave the same versioned repository")
+	}
 }
 
 // A functionRef is a DNS label, cut at 63 characters. A repository long enough
 // to push the version past the cut would name every version of a function the
 // same, so the build has to refuse rather than produce it.
-func TestVersionFunctionsRepositoryTooLong(t *testing.T) {
+func TestVersionFunctionRepositoryTooLong(t *testing.T) {
 	t.Parallel()
-
-	projFS := afero.NewMemMapFs()
-	if err := afero.WriteFile(projFS, "functions/fn-one/main.k", []byte("a = 1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	proj := &devv1alpha1.Project{Spec: devv1alpha1.ProjectSpec{
-		Repository: "xpkg.crossplane.io/an-organisation-with-a-long-name/a-project-with-a-long-name",
-	}}
-	proj.Default()
-
-	fns := []devv1alpha1.Function{{
-		Source:    devv1alpha1.FunctionSourceDirectory,
-		Directory: &devv1alpha1.FunctionDirectory{Name: "fn-one"},
-	}}
 
 	// The unversioned name still fits, so this project builds fine today; it is
 	// only versioning it that does not work.
-	if _, err := versionFunctions(projFS, proj, fns, ""); err == nil {
-		t.Error("versionFunctions accepted a repository too long to carry a version")
+	repo := "xpkg.crossplane.io/an-organisation-with-a-long-name/a-project-with-a-long-name"
+	if _, err := versionFunction(repo, "fn-one", testDigest); err == nil {
+		t.Error("versionFunction accepted a repository too long to carry a version")
 	}
 }
 

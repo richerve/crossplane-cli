@@ -103,10 +103,11 @@ type ProjectSpec struct {
 	// packaged. If omitted, all subdirectories of the functions path are
 	// treated as Directory-source functions and built automatically.
 	Functions []Function `json:"functions,omitempty"`
-	// VersionedFunctions appends a hash of each embedded function's source to
-	// the OCI repository path it is pushed to, so that every version of a
-	// function's source gets its own repository, its own package, and its own
-	// Function object in the cluster. Pipeline steps referencing those
+	// VersionedFunctions appends the start of each embedded function's package
+	// digest to the OCI repository path it is pushed to, so that every build
+	// of a function that produces a different package gets its own
+	// repository, its own package, and its own Function object in the
+	// cluster. Pipeline steps referencing those
 	// functions are rewritten at build time to name the version they were
 	// built against; the project's own files are left alone.
 	//
@@ -118,8 +119,8 @@ type ProjectSpec struct {
 	// never removes a package it installed for a dependency.
 	//
 	// The cost is one repository, one Function object, and one running
-	// function pod per version of each function's source, for as far back as
-	// rollback targets reach.
+	// function pod per version of each function, for as far back as rollback
+	// targets reach.
 	// +optional
 	VersionedFunctions bool `json:"versionedFunctions,omitempty"`
 	// Paths defines the relative paths to various parts of the project.

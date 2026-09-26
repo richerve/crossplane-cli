@@ -295,23 +295,11 @@ func (b *Builder) Build(ctx context.Context, project *devv1alpha1.Project, proje
 		o.eventCh.SendEvent("Generating schemas", async.EventStatusSuccess)
 	}
 
-	// Work out the versioned name of each function before building it, so
-	// that the package is built and tagged under the repository it will be
-	// pushed to. This has to happen after schema generation: a function reaches
-	// the project's generated models through a symlink in its own directory,
-	// so the models are part of the source being hashed.
-	var versions map[string]functionVersion
-	if project.Spec.VersionedFunctions && !o.noFunctionVersioning {
-		o.log.Debug("Versioning functions")
-		versions, err = versionFunctions(projectFS, project, fns, o.projectBasePath)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to version functions")
-		}
-	}
-
-	// Build the resolved functions.
+	// Build the resolved functions. In a versioned build each function is
+	// named after the digest it built to, which buildFunctions reports back.
 	o.log.Debug("Building functions")
-	imgMap, deps, err := b.buildFunctions(ctx, projectFS, project, fns, versions, o.projectBasePath, o.eventCh)
+	versioned := project.Spec.VersionedFunctions && !o.noFunctionVersioning
+	imgMap, deps, versions, err := b.buildFunctions(ctx, projectFS, project, fns, versioned, o.projectBasePath, o.eventCh)
 	if err != nil {
 		return nil, err
 	}
@@ -399,12 +387,19 @@ func resolveFunctions(project *devv1alpha1.Project, projectFS afero.Fs) ([]devv1
 	return fns, nil
 }
 
-// buildFunctions builds the given list of embedded functions.
-func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, project *devv1alpha1.Project, fns []devv1alpha1.Function, versions map[string]functionVersion, basePath string, eventCh async.EventChannel) (ImageTagMap, []xpmetav1.Dependency, error) {
+// buildFunctions builds the given list of embedded functions. When versioned
+// is true each function is pushed to a repository named after the digest of
+// the index it built to, and the returned map holds that naming, keyed by
+// function name. It is nil otherwise.
+func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, project *devv1alpha1.Project, fns []devv1alpha1.Function, versioned bool, basePath string, eventCh async.EventChannel) (ImageTagMap, []xpmetav1.Dependency, map[string]functionVersion, error) {
 	var (
-		imgMap = make(map[name.Tag]v1.Image)
-		imgMu  sync.Mutex
+		imgMap   = make(map[name.Tag]v1.Image)
+		versions map[string]functionVersion
+		mu       sync.Mutex
 	)
+	if versioned {
+		versions = make(map[string]functionVersion, len(fns))
+	}
 
 	deps := make([]xpmetav1.Dependency, len(fns))
 	eg, ctx := errgroup.WithContext(ctx)
@@ -421,10 +416,6 @@ func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, projec
 			eventText := fmt.Sprintf("Building function %s", fnName)
 			eventCh.SendEvent(eventText, async.EventStatusStarted)
 
-			fnRepo := functionRepository(project.Spec.Repository, fnName, "")
-			if v, ok := versions[fnName]; ok {
-				fnRepo = v.repo
-			}
 			imgs, err := b.buildFunction(ctx, projectFS, project, fn, basePath)
 			if err != nil {
 				eventCh.SendEvent(eventText, async.EventStatusFailure)
@@ -438,6 +429,22 @@ func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, projec
 			dgst, err := idx.Digest()
 			if err != nil {
 				return errors.Wrapf(err, "failed to get index digest for function image %q", fnName)
+			}
+
+			// The package's contents do not depend on the repository it is
+			// pushed to, so the digest can name the repository without
+			// changing itself.
+			fnRepo := functionRepository(project.Spec.Repository, fnName, "")
+			if versioned {
+				v, err := versionFunction(project.Spec.Repository, fnName, dgst)
+				if err != nil {
+					eventCh.SendEvent(eventText, async.EventStatusFailure)
+					return err
+				}
+				fnRepo = v.repo
+				mu.Lock()
+				versions[fnName] = v
+				mu.Unlock()
 			}
 			deps[i] = xpmetav1.Dependency{
 				APIVersion: new(xpkgv1.FunctionGroupVersionKind.GroupVersion().String()),
@@ -457,9 +464,9 @@ func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, projec
 				if err != nil {
 					return errors.Wrapf(err, "failed to construct tag for function image %q", fnName)
 				}
-				imgMu.Lock()
+				mu.Lock()
 				imgMap[imgTag] = img
-				imgMu.Unlock()
+				mu.Unlock()
 			}
 
 			eventCh.SendEvent(eventText, async.EventStatusSuccess)
@@ -469,10 +476,10 @@ func (b *Builder) buildFunctions(ctx context.Context, projectFS afero.Fs, projec
 	}
 
 	if err := eg.Wait(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return imgMap, deps, nil
+	return imgMap, deps, versions, nil
 }
 
 // buildFunction builds the package images for a single function. It resolves
